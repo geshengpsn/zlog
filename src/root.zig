@@ -98,9 +98,16 @@ pub const Monitor = struct {
         monitor.server_thread = try std.Thread.spawn(.{}, startServer, .{ io, address, &monitor.start_server_event, &monitor.connected_ws_event, &monitor.stop_event, &monitor.connected_address, &monitor.address_mutex, &monitor.queue });
 
         try monitor.start_server_event.wait(io);
-        std.debug.print("open browser at http://127.0.0.1:{d}/?port={d}\n", .{ listen_port, listen_port });
+        // std.debug.print("open browser at http://127.0.0.1:{d}/?port={d}\n", .{ listen_port, listen_port });
+
+        var url_buffer: [126]u8 = undefined;
+        const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
+        _ = try std.process.spawn(io, .{
+            .argv = &.{ "open", url },
+        });
+
         try monitor.connected_ws_event.wait(io);
-        std.debug.print("connected ws: {f}\n", .{monitor.connected_address orelse unreachable});
+        // std.debug.print("connected ws: {f}\n", .{monitor.connected_address orelse unreachable});
 
         return monitor;
     }
@@ -143,8 +150,6 @@ pub const Monitor = struct {
 fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, connected_ws_event: *Io.Event, stop_event: *Io.Event, connected_address: *?net.IpAddress, address_mutex: *Io.Mutex, ch: *Io.Queue(LogMsg)) !void {
     var tcp_server = try address.listen(io, .{ .reuse_address = true });
     defer tcp_server.deinit(io);
-    std.debug.print("server listening at http://{f}/\n", .{tcp_server.socket.address});
-    std.debug.print("websocket endpoint: ws://{f}/ws\n", .{tcp_server.socket.address});
     start_server_event.set(io);
     while (true) {
         if (stop_event.isSet()) {
@@ -218,10 +223,10 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
                     address_mutex.unlock(io);
                     connected_ws_event.set(io);
 
-                    ws.writeMessage("connected\n", .text) catch |err| {
-                        std.debug.print("websocket welcome failed: {s}\n", .{@errorName(err)});
-                        return;
-                    };
+                    // ws.writeMessage("connected\n", .text) catch |err| {
+                    //     std.debug.print("websocket welcome failed: {s}\n", .{@errorName(err)});
+                    //     return;
+                    // };
 
                     serveWebSocket(&ws, io, ch);
                     return;
