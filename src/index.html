@@ -1,0 +1,507 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width,initial-scale=1" />
+        <title>zlog monitor</title>
+        <style>
+            :root {
+                --bg-a: #121417;
+                --bg-b: #1c2128;
+                --panel: rgba(18, 23, 29, 0.78);
+                --line: rgba(255, 255, 255, 0.14);
+                --text: #f4f7fa;
+                --muted: #a9b4c0;
+                --ok: #33d38f;
+                --warn: #ffd166;
+                --bad: #ff5d73;
+            }
+
+            * {
+                box-sizing: border-box;
+            }
+
+            html,
+            body {
+                margin: 0;
+                width: 100%;
+                height: 100%;
+                background: radial-gradient(
+                        circle at 18% 15%,
+                        rgba(108, 192, 255, 0.15),
+                        transparent 45%
+                    ),
+                    radial-gradient(
+                        circle at 85% 15%,
+                        rgba(255, 204, 120, 0.1),
+                        transparent 38%
+                    ),
+                    linear-gradient(155deg, var(--bg-a), var(--bg-b));
+                color: var(--text);
+                font-family: "JetBrains Mono", "IBM Plex Mono", monospace;
+            }
+
+            #app {
+                position: relative;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+            }
+
+            #viewport {
+                position: absolute;
+                inset: 0;
+            }
+
+            #panel {
+                position: absolute;
+                top: 1rem;
+                left: 1rem;
+                width: min(27rem, calc(100vw - 2rem));
+                max-height: calc(100vh - 2rem);
+                border: 1px solid var(--line);
+                border-radius: 0.9rem;
+                padding: 0.85rem;
+                background: var(--panel);
+                backdrop-filter: blur(10px);
+                box-shadow: 0 12px 30px rgba(0, 0, 0, 0.32);
+                overflow: auto;
+            }
+
+            h1 {
+                margin: 0 0 0.35rem;
+                font-size: 1.05rem;
+                letter-spacing: 0.04em;
+            }
+
+            .muted {
+                margin: 0 0 0.7rem;
+                font-size: 0.78rem;
+                color: var(--muted);
+            }
+
+            .kv {
+                margin-bottom: 0.5rem;
+                font-size: 0.78rem;
+                line-height: 1.45;
+            }
+
+            #status {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.4rem;
+                border: 1px solid var(--line);
+                border-radius: 999px;
+                padding: 0.2rem 0.6rem;
+                margin-bottom: 0.6rem;
+                font-size: 0.75rem;
+            }
+
+            #status::before {
+                content: "";
+                width: 0.5rem;
+                height: 0.5rem;
+                border-radius: 50%;
+                background: var(--warn);
+            }
+
+            #status[data-kind="connected"]::before {
+                background: var(--ok);
+            }
+
+            #status[data-kind="closed"],
+            #status[data-kind="error"] {
+                color: #ffd2d9;
+            }
+
+            #status[data-kind="closed"]::before,
+            #status[data-kind="error"]::before {
+                background: var(--bad);
+            }
+
+            pre {
+                margin: 0;
+                white-space: pre-wrap;
+                word-break: break-word;
+                border: 1px solid var(--line);
+                border-radius: 0.6rem;
+                padding: 0.55rem;
+                background: rgba(0, 0, 0, 0.26);
+                font-size: 0.74rem;
+            }
+
+            #log {
+                margin-top: 0.5rem;
+                min-height: 8.5rem;
+                max-height: 12rem;
+                overflow: auto;
+                border: 1px solid var(--line);
+                border-radius: 0.6rem;
+                padding: 0.55rem;
+                background: rgba(0, 0, 0, 0.26);
+                font-size: 0.73rem;
+                line-height: 1.4;
+            }
+
+            @media (max-width: 640px) {
+                #panel {
+                    top: 0.6rem;
+                    left: 0.6rem;
+                    width: calc(100vw - 1.2rem);
+                    max-height: 50vh;
+                }
+            }
+        </style>
+    </head>
+    <body>
+        <div id="app">
+            <div id="viewport"></div>
+            <aside id="panel">
+                <h1>zlog realtime monitor</h1>
+                <p class="muted">
+                    three.js scene follows websocket `LogMsg` updates.
+                </p>
+                <div id="status" data-kind="connecting">connecting</div>
+                <div class="kv" id="endpoint"></div>
+                <div class="kv" id="url-port"></div>
+                <pre id="latest">waiting for frame...</pre>
+                <div id="log"></div>
+            </aside>
+        </div>
+
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "https://unpkg.com/three@0.182.0/build/three.module.js",
+                    "three/addons/": "https://unpkg.com/three@0.182.0/examples/jsm/"
+                }
+            }
+        </script>
+        <script type="module">
+            import * as THREE from "three";
+            import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+
+            const viewport = document.getElementById("viewport");
+            const statusEl = document.getElementById("status");
+            const endpointEl = document.getElementById("endpoint");
+            const urlPortEl = document.getElementById("url-port");
+            const latestEl = document.getElementById("latest");
+            const logEl = document.getElementById("log");
+
+            const decoder = new TextDecoder();
+            const urlParams = new URLSearchParams(location.search);
+            const wsPort = urlParams.get("port") || location.port || "5678";
+            const wsHost = urlParams.get("host") || location.hostname;
+            const wsProtocol = location.protocol === "https:" ? "wss" : "ws";
+            const wsUrl = `${wsProtocol}://${wsHost}:${wsPort}/ws`;
+
+            const scene = new THREE.Scene();
+            scene.background = new THREE.Color(0x242424);
+            scene.fog = new THREE.Fog(0x242424, 0.1, 100);
+
+            const camera = new THREE.PerspectiveCamera(
+                50,
+                viewport.clientWidth / viewport.clientHeight,
+                0.001,
+                100,
+            );
+            camera.up.set(0, 0, 1);
+            camera.position.set(1.5, 1.5, 1.5);
+            camera.lookAt(0, 0, 0);
+
+            const renderer = new THREE.WebGLRenderer({ antialias: true });
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            renderer.setSize(viewport.clientWidth, viewport.clientHeight);
+            viewport.append(renderer.domElement);
+
+            const controls = new OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.08;
+            controls.target.set(0, 0, 0);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 1));
+            const directionalLight = new THREE.DirectionalLight(0xffffff, 1);
+            directionalLight.position.set(0, 1, 1.5);
+            scene.add(directionalLight);
+
+            const grid = new THREE.GridHelper(10, 10, 0x666666, 0x666666);
+            grid.rotation.x = Math.PI / 2;
+            grid.position.z = -0.001;
+            scene.add(grid);
+            scene.add(new THREE.AxesHelper(1.5));
+
+            const mainScene = new THREE.Group();
+            mainScene.name = "main_scene";
+            scene.add(mainScene);
+
+            const nodeByPath = new Map([["/", mainScene]]);
+            let reconnectTimer = null;
+
+            function addLog(message) {
+                const now = new Date().toLocaleTimeString();
+                const line = `[${now}] ${message}`;
+                logEl.textContent = `${line}\n${logEl.textContent}`;
+                logEl.textContent = logEl.textContent
+                    .split("\n")
+                    .slice(0, 18)
+                    .join("\n");
+            }
+
+            function setStatus(kind, text) {
+                statusEl.dataset.kind = kind;
+                statusEl.textContent = text;
+            }
+
+            function normalizePath(path) {
+                if (typeof path !== "string") {
+                    return "/";
+                }
+                const parts = path.split("/").filter(Boolean);
+                return parts.length === 0 ? "/" : `/${parts.join("/")}`;
+            }
+
+            function ensureNode(path) {
+                const normalized = normalizePath(path);
+                if (nodeByPath.has(normalized)) {
+                    return nodeByPath.get(normalized);
+                }
+
+                const parts = normalized.split("/").filter(Boolean);
+                let current = mainScene;
+                let currentPath = "";
+                for (const part of parts) {
+                    currentPath += `/${part}`;
+                    let next = nodeByPath.get(currentPath);
+                    if (!next) {
+                        next = new THREE.Group();
+                        next.name = part;
+                        current.add(next);
+                        nodeByPath.set(currentPath, next);
+                    }
+                    current = next;
+                }
+
+                return current;
+            }
+
+            function disposeShape(shape) {
+                shape.traverse((obj) => {
+                    if (obj.geometry) {
+                        obj.geometry.dispose();
+                    }
+                    if (obj.material) {
+                        if (Array.isArray(obj.material)) {
+                            obj.material.forEach((mat) => mat.dispose());
+                        } else {
+                            obj.material.dispose();
+                        }
+                    }
+                });
+            }
+
+            function replaceNodeShape(node, mesh) {
+                const prev = node.getObjectByName("__shape__");
+                if (prev) {
+                    node.remove(prev);
+                    disposeShape(prev);
+                }
+                mesh.name = "__shape__";
+                node.add(mesh);
+            }
+
+            function ensureTransformMarker(node) {
+                const marker = node.getObjectByName("__marker__");
+                if (marker) {
+                    return;
+                }
+                const markerMesh = new THREE.Mesh(
+                    new THREE.SphereGeometry(0.03, 16, 12),
+                    new THREE.MeshBasicMaterial({ color: 0xff7070 }),
+                );
+                markerMesh.name = "__marker__";
+                node.add(markerMesh);
+            }
+
+            function applyTransform(path, transform) {
+                const node = ensureNode(path);
+                ensureTransformMarker(node);
+                const x = Number(transform?.x ?? 0);
+                const y = Number(transform?.y ?? 0);
+                const z = Number(transform?.z ?? 0);
+                node.position.set(x, y, z);
+
+                const w = Number(transform?.w ?? 1);
+                const i = Number(transform?.i ?? 0);
+                const j = Number(transform?.j ?? 0);
+                const k = Number(transform?.k ?? 0);
+                const norm2 = w * w + i * i + j * j + k * k;
+                if (norm2 > 1e-12) {
+                    node.quaternion.set(i, j, k, w).normalize();
+                } else {
+                    node.quaternion.identity();
+                }
+            }
+
+            function makeMaterial(color) {
+                return new THREE.MeshStandardMaterial({
+                    color,
+                    metalness: 0.15,
+                    roughness: 0.5,
+                });
+            }
+
+            function applyShape(path, shapeUnion) {
+                const node = ensureNode(path);
+                const shapeType = Object.keys(shapeUnion || {})[0];
+                const shape = shapeUnion?.[shapeType];
+                if (!shapeType || !shape) {
+                    return;
+                }
+
+                let mesh = null;
+
+                if (shapeType === "Box") {
+                    const width = Math.max(0.001, Number(shape.width ?? 0.2));
+                    const length = Math.max(0.001, Number(shape.length ?? 0.2));
+                    const height = Math.max(0.001, Number(shape.height ?? 0.2));
+                    mesh = new THREE.Mesh(
+                        new THREE.BoxGeometry(width, length, height),
+                        makeMaterial(0x6cc0ff),
+                    );
+                } else if (shapeType === "Sphere") {
+                    const r = Math.max(0.001, Number(shape.r ?? 0.1));
+                    node.position.set(
+                        Number(shape.x ?? 0),
+                        Number(shape.y ?? 0),
+                        Number(shape.z ?? 0),
+                    );
+                    mesh = new THREE.Mesh(
+                        new THREE.SphereGeometry(r, 28, 20),
+                        makeMaterial(0xffc46d),
+                    );
+                } else if (shapeType === "Cylinder") {
+                    const r = Math.max(0.001, Number(shape.r ?? 0.08));
+                    const h = Math.max(0.001, Number(shape.h ?? 0.2));
+                    node.position.set(
+                        Number(shape.x ?? 0),
+                        Number(shape.y ?? 0),
+                        Number(shape.z ?? 0),
+                    );
+                    mesh = new THREE.Mesh(
+                        new THREE.CylinderGeometry(r, r, h, 28),
+                        makeMaterial(0x98f5a8),
+                    );
+                    mesh.rotateX(Math.PI / 2);
+                } else if (shapeType === "Mesh") {
+                    mesh = new THREE.Mesh(
+                        new THREE.BoxGeometry(0.1, 0.1, 0.1),
+                        new THREE.MeshBasicMaterial({
+                            color: 0xf190ff,
+                            wireframe: true,
+                        }),
+                    );
+                    mesh.userData.meshPath = String(shape.path || "");
+                }
+
+                if (mesh) {
+                    replaceNodeShape(node, mesh);
+                }
+            }
+
+            function applyLogMsg(logMsg) {
+                const path = normalizePath(logMsg?.path);
+                const data = logMsg?.data;
+                if (!data || typeof data !== "object") {
+                    return;
+                }
+
+                if (data.Transform) {
+                    applyTransform(path, data.Transform);
+                }
+                if (data.Shape) {
+                    applyShape(path, data.Shape);
+                }
+
+                latestEl.textContent = JSON.stringify(logMsg, null, 2);
+            }
+
+            function handleBinaryMessage(buffer) {
+                const text = decoder.decode(new Uint8Array(buffer));
+                try {
+                    const logMsg = JSON.parse(text);
+                    applyLogMsg(logMsg);
+                    addLog(`frame applied: ${normalizePath(logMsg.path)}`);
+                } catch {
+                    addLog(`binary decode failed: ${text.slice(0, 180)}`);
+                }
+            }
+
+            function connectWebSocket() {
+                if (reconnectTimer !== null) {
+                    clearTimeout(reconnectTimer);
+                    reconnectTimer = null;
+                }
+
+                setStatus("connecting", "connecting");
+                addLog(`connecting: ${wsUrl}`);
+
+                const ws = new WebSocket(wsUrl);
+                ws.binaryType = "arraybuffer";
+
+                ws.addEventListener("open", () => {
+                    setStatus("connected", "connected");
+                    addLog("ws connected");
+                });
+
+                ws.addEventListener("message", async (event) => {
+                    if (typeof event.data === "string") {
+                        addLog(`text: ${event.data.trim()}`);
+                        return;
+                    }
+
+                    if (event.data instanceof ArrayBuffer) {
+                        handleBinaryMessage(event.data);
+                        return;
+                    }
+
+                    if (event.data && typeof event.data.arrayBuffer === "function") {
+                        handleBinaryMessage(await event.data.arrayBuffer());
+                    }
+                });
+
+                ws.addEventListener("error", () => {
+                    setStatus("error", "error");
+                    addLog("ws error");
+                });
+
+                ws.addEventListener("close", () => {
+                    setStatus("closed", "closed");
+                    addLog("ws closed, reconnecting in 1s");
+                    reconnectTimer = window.setTimeout(connectWebSocket, 1000);
+                });
+            }
+
+            function onResize() {
+                const width = viewport.clientWidth;
+                const height = viewport.clientHeight;
+                camera.aspect = width / height;
+                camera.updateProjectionMatrix();
+                renderer.setSize(width, height);
+            }
+
+            function animate() {
+                controls.update();
+                renderer.render(scene, camera);
+                requestAnimationFrame(animate);
+            }
+
+            endpointEl.textContent = `endpoint: ${wsUrl}`;
+            urlPortEl.textContent = `url port: ${urlParams.get("port") ?? "(not set)"}`;
+            addLog("scene initialized");
+
+            window.addEventListener("resize", onResize);
+            connectWebSocket();
+            animate();
+        </script>
+    </body>
+</html>
