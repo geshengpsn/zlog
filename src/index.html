@@ -159,7 +159,7 @@
             <aside id="panel">
                 <h1>zlog realtime monitor</h1>
                 <p class="muted">
-                    three.js scene follows websocket `LogMsg` updates.
+                    three.js scene follows websocket `Command` updates.
                 </p>
                 <div id="status" data-kind="connecting">connecting</div>
                 <div class="kv" id="endpoint"></div>
@@ -234,7 +234,7 @@
             mainScene.name = "main_scene";
             scene.add(mainScene);
 
-            const nodeByPath = new Map([["/", mainScene]]);
+            const objectById = new Map();
             let reconnectTimer = null;
 
             function addLog(message) {
@@ -252,40 +252,13 @@
                 statusEl.textContent = text;
             }
 
-            function normalizePath(path) {
-                if (typeof path !== "string") {
-                    return "/";
-                }
-                const parts = path.split("/").filter(Boolean);
-                return parts.length === 0 ? "/" : `/${parts.join("/")}`;
+            function numberOr(value, fallback) {
+                const number = Number(value);
+                return Number.isFinite(number) ? number : fallback;
             }
 
-            function ensureNode(path) {
-                const normalized = normalizePath(path);
-                if (nodeByPath.has(normalized)) {
-                    return nodeByPath.get(normalized);
-                }
-
-                const parts = normalized.split("/").filter(Boolean);
-                let current = mainScene;
-                let currentPath = "";
-                for (const part of parts) {
-                    currentPath += `/${part}`;
-                    let next = nodeByPath.get(currentPath);
-                    if (!next) {
-                        next = new THREE.Group();
-                        next.name = part;
-                        current.add(next);
-                        nodeByPath.set(currentPath, next);
-                    }
-                    current = next;
-                }
-
-                return current;
-            }
-
-            function disposeShape(shape) {
-                shape.traverse((obj) => {
+            function disposeObject(object) {
+                object.traverse((obj) => {
                     if (obj.geometry) {
                         obj.geometry.dispose();
                     }
@@ -299,138 +272,195 @@
                 });
             }
 
-            function replaceNodeShape(node, mesh) {
-                const prev = node.getObjectByName("__shape__");
-                if (prev) {
-                    node.remove(prev);
-                    disposeShape(prev);
-                }
-                mesh.name = "__shape__";
-                node.add(mesh);
-            }
-
-            function ensureTransformMarker(node) {
-                const marker = node.getObjectByName("__marker__");
-                if (marker) {
-                    return;
-                }
-                const markerMesh = new THREE.Mesh(
-                    new THREE.SphereGeometry(0.03, 16, 12),
-                    new THREE.MeshBasicMaterial({ color: 0xff7070 }),
+            function makeMaterial(material = {}) {
+                const color = material.color || {};
+                const opacity = numberOr(material.opacity, 1);
+                const threeColor = new THREE.Color().setRGB(
+                    numberOr(color.r, 255) / 255,
+                    numberOr(color.g, 255) / 255,
+                    numberOr(color.b, 255) / 255,
+                    THREE.SRGBColorSpace,
                 );
-                markerMesh.name = "__marker__";
-                node.add(markerMesh);
-            }
-
-            function applyTransform(path, transform) {
-                const node = ensureNode(path);
-                ensureTransformMarker(node);
-                const x = Number(transform?.x ?? 0);
-                const y = Number(transform?.y ?? 0);
-                const z = Number(transform?.z ?? 0);
-                node.position.set(x, y, z);
-
-                const w = Number(transform?.w ?? 1);
-                const i = Number(transform?.i ?? 0);
-                const j = Number(transform?.j ?? 0);
-                const k = Number(transform?.k ?? 0);
-                const norm2 = w * w + i * i + j * j + k * k;
-                if (norm2 > 1e-12) {
-                    node.quaternion.set(i, j, k, w).normalize();
-                } else {
-                    node.quaternion.identity();
-                }
-            }
-
-            function makeMaterial(color) {
                 return new THREE.MeshStandardMaterial({
-                    color,
-                    metalness: 0.15,
-                    roughness: 0.5,
+                    color: threeColor,
+                    opacity,
+                    transparent: opacity < 1,
+                    metalness: numberOr(material.metalness, 0),
+                    roughness: numberOr(material.roughness, 0.5),
                 });
             }
 
-            function applyShape(path, shapeUnion) {
-                const node = ensureNode(path);
-                const shapeType = Object.keys(shapeUnion || {})[0];
-                const shape = shapeUnion?.[shapeType];
-                if (!shapeType || !shape) {
-                    return;
+            function makeArrowGeometry(arrow, material) {
+                const length = Math.max(0.001, numberOr(arrow.length, 1));
+                const headLength = Math.max(0.001, numberOr(arrow.head_length, 0.2));
+                const shaftLength = Math.max(0.001, length - headLength);
+                const shaftRadius = Math.max(0.001, numberOr(arrow.shaft_radius, 0.02));
+                const headRadius = Math.max(0.001, numberOr(arrow.head_radius, 0.06));
+                const group = new THREE.Group();
+                const shaft = new THREE.Mesh(
+                    new THREE.CylinderGeometry(shaftRadius, shaftRadius, shaftLength, 16),
+                    material.clone(),
+                );
+                shaft.rotation.x = Math.PI / 2;
+                shaft.position.z = shaftLength / 2;
+                const head = new THREE.Mesh(
+                    new THREE.ConeGeometry(headRadius, headLength, 24),
+                    material.clone(),
+                );
+                head.rotation.x = Math.PI / 2;
+                head.position.z = shaftLength + headLength / 2;
+                group.add(shaft, head);
+                material.dispose();
+                return group;
+            }
+
+            function makeFrameGeometry(frame) {
+                return new THREE.AxesHelper(
+                    Math.max(0.001, numberOr(frame.axis_length, 1)),
+                );
+            }
+
+            function makeObject3D(object) {
+                const geometryUnion = object?.geometry;
+                const geometryType = Object.keys(geometryUnion || {})[0];
+                const geometry = geometryUnion?.[geometryType];
+                const material = makeMaterial(object?.material);
+                if (!geometryType || !geometry) {
+                    material.dispose();
+                    return null;
                 }
 
-                let mesh = null;
-
-                if (shapeType === "Box") {
-                    const width = Math.max(0.001, Number(shape.width ?? 0.2));
-                    const length = Math.max(0.001, Number(shape.length ?? 0.2));
-                    const height = Math.max(0.001, Number(shape.height ?? 0.2));
-                    mesh = new THREE.Mesh(
-                        new THREE.BoxGeometry(width, length, height),
-                        makeMaterial(0x6cc0ff),
+                if (geometryType === "cube") {
+                    return new THREE.Mesh(
+                        new THREE.BoxGeometry(
+                            Math.max(0.001, numberOr(geometry.width, 1)),
+                            Math.max(0.001, numberOr(geometry.height, 1)),
+                            Math.max(0.001, numberOr(geometry.depth, 1)),
+                        ),
+                        material,
                     );
-                } else if (shapeType === "Sphere") {
-                    const r = Math.max(0.001, Number(shape.r ?? 0.1));
-                    node.position.set(
-                        Number(shape.x ?? 0),
-                        Number(shape.y ?? 0),
-                        Number(shape.z ?? 0),
+                }
+                if (geometryType === "sphere") {
+                    return new THREE.Mesh(
+                        new THREE.SphereGeometry(
+                            Math.max(0.001, numberOr(geometry.radius, 0.5)),
+                            Math.max(3, Math.trunc(numberOr(geometry.width_segments, 32))),
+                            Math.max(2, Math.trunc(numberOr(geometry.height_segments, 16))),
+                        ),
+                        material,
                     );
-                    mesh = new THREE.Mesh(
-                        new THREE.SphereGeometry(r, 28, 20),
-                        makeMaterial(0xffc46d),
+                }
+                if (geometryType === "cylinder") {
+                    const mesh = new THREE.Mesh(
+                        new THREE.CylinderGeometry(
+                            Math.max(0.001, numberOr(geometry.radius_top, 0.5)),
+                            Math.max(0.001, numberOr(geometry.radius_bottom, 0.5)),
+                            Math.max(0.001, numberOr(geometry.height, 1)),
+                            Math.max(3, Math.trunc(numberOr(geometry.radial_segments, 32))),
+                        ),
+                        material,
                     );
-                } else if (shapeType === "Cylinder") {
-                    const r = Math.max(0.001, Number(shape.r ?? 0.08));
-                    const h = Math.max(0.001, Number(shape.h ?? 0.2));
-                    node.position.set(
-                        Number(shape.x ?? 0),
-                        Number(shape.y ?? 0),
-                        Number(shape.z ?? 0),
-                    );
-                    mesh = new THREE.Mesh(
-                        new THREE.CylinderGeometry(r, r, h, 28),
-                        makeMaterial(0x98f5a8),
-                    );
-                    mesh.rotateX(Math.PI / 2);
-                } else if (shapeType === "Mesh") {
-                    mesh = new THREE.Mesh(
-                        new THREE.BoxGeometry(0.1, 0.1, 0.1),
-                        new THREE.MeshBasicMaterial({
-                            color: 0xf190ff,
-                            wireframe: true,
-                        }),
-                    );
-                    mesh.userData.meshPath = String(shape.path || "");
+                    mesh.rotation.x = Math.PI / 2;
+                    return mesh;
+                }
+                if (geometryType === "arrow") {
+                    return makeArrowGeometry(geometry, material);
+                }
+                if (geometryType === "frame") {
+                    material.dispose();
+                    return makeFrameGeometry(geometry);
                 }
 
-                if (mesh) {
-                    replaceNodeShape(node, mesh);
+                material.dispose();
+                return null;
+            }
+
+            function applyPose(target, pose = {}) {
+                const position = Array.isArray(pose.position) ? pose.position : [];
+                target.position.set(
+                    numberOr(position[0], 0),
+                    numberOr(position[1], 0),
+                    numberOr(position[2], 0),
+                );
+
+                const rotation = pose.rotation || {};
+                const w = numberOr(rotation.w, 1);
+                const x = numberOr(rotation.x, 0);
+                const y = numberOr(rotation.y, 0);
+                const z = numberOr(rotation.z, 0);
+                const norm2 = w * w + x * x + y * y + z * z;
+                if (norm2 > 1e-12) {
+                    target.quaternion.set(x, y, z, w).normalize();
+                } else {
+                    target.quaternion.identity();
                 }
             }
 
-            function applyLogMsg(logMsg) {
-                const path = normalizePath(logMsg?.path);
-                const data = logMsg?.data;
-                if (!data || typeof data !== "object") {
-                    return;
+            function removeObject(id) {
+                const object = objectById.get(id);
+                if (!object) {
+                    return false;
+                }
+                mainScene.remove(object);
+                disposeObject(object);
+                objectById.delete(id);
+                return true;
+            }
+
+            function applyCommand(command) {
+                if (!command || typeof command !== "object") {
+                    return "ignored invalid command";
                 }
 
-                if (data.Transform) {
-                    applyTransform(path, data.Transform);
-                }
-                if (data.Shape) {
-                    applyShape(path, data.Shape);
+                if (command.remove) {
+                    const id = String(command.remove.id ?? "");
+                    if (!id) {
+                        return "ignored remove without id";
+                    }
+                    const removed = removeObject(id);
+                    latestEl.textContent = JSON.stringify(command, null, 2);
+                    return removed ? `removed: ${id}` : `remove missed: ${id}`;
                 }
 
-                latestEl.textContent = JSON.stringify(logMsg, null, 2);
+                if (command.add) {
+                    const id = String(command.add.id ?? "");
+                    if (!id) {
+                        return "ignored add without id";
+                    }
+                    const content = makeObject3D(command.add.object);
+                    if (!content) {
+                        return `ignored add with unsupported geometry: ${id}`;
+                    }
+                    removeObject(id);
+                    const object = new THREE.Group();
+                    object.name = id;
+                    object.add(content);
+                    applyPose(object, command.add.object?.pose);
+                    objectById.set(id, object);
+                    mainScene.add(object);
+                    latestEl.textContent = JSON.stringify(command, null, 2);
+                    return `added: ${id}`;
+                }
+
+                if (command.set_pose) {
+                    const id = String(command.set_pose.id ?? "");
+                    const object = objectById.get(id);
+                    if (!id || !object) {
+                        return `pose missed: ${id || "(empty id)"}`;
+                    }
+                    applyPose(object, command.set_pose.pose);
+                    latestEl.textContent = JSON.stringify(command, null, 2);
+                    return `pose updated: ${id}`;
+                }
+
+                return "ignored unknown command";
             }
 
             function handleBinaryMessage(buffer) {
                 const text = decoder.decode(new Uint8Array(buffer));
                 try {
-                    const logMsg = JSON.parse(text);
-                    applyLogMsg(logMsg);
-                    addLog(`frame applied: ${normalizePath(logMsg.path)}`);
+                    const command = JSON.parse(text);
+                    addLog(applyCommand(command));
                 } catch {
                     addLog(`binary decode failed: ${text.slice(0, 180)}`);
                 }

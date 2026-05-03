@@ -1,65 +1,14 @@
 const std = @import("std");
+const objects = @import("object.zig");
+const commands = @import("commands.zig");
+pub const Command = commands.Command;
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
 
-const LogDataType = enum { Transform, Shape };
-
-const Transform = struct {
-    x: f64,
-    y: f64,
-    z: f64,
-    w: f64,
-    i: f64,
-    j: f64,
-    k: f64,
-};
-const ShapeType = enum { Box, Sphere, Cylinder, Mesh };
-
-const Box = struct {
-    width: f64,
-    length: f64,
-    height: f64,
-};
-
-const Sphere = struct {
-    x: f64,
-    y: f64,
-    z: f64,
-    r: f64,
-};
-
-const Cylinder = struct {
-    x: f64,
-    y: f64,
-    z: f64,
-    r: f64,
-    h: f64,
-};
-
-const Mesh = struct { path: []const u8 };
-
-pub const LogData = union(LogDataType) { Transform: Transform, Shape: union(ShapeType) {
-    Box: Box,
-    Sphere: Sphere,
-    Cylinder: Cylinder,
-    Mesh: Mesh,
-} };
-
-const LogMsg = struct {
-    path: []const u8,
-    data: LogData,
-
-    fn writeBuffer(msg: @This(), buffer: []u8) []const u8 {
-        var writer: std.Io.Writer = .fixed(buffer);
-        std.json.Stringify.value(msg, .{}, &writer) catch return buffer[0..0];
-        return writer.buffered();
-    }
-};
-
-pub const Monitor = struct {
-    queue_buffer: [1024]LogMsg,
-    queue: Io.Queue(LogMsg),
+pub const Viewer = struct {
+    queue_buffer: [1024]Command,
+    queue: Io.Queue(Command),
     server_thread: ?std.Thread,
     listen_port: u16,
     address_mutex: Io.Mutex,
@@ -73,8 +22,8 @@ pub const Monitor = struct {
         connected,
     };
 
-    pub fn open(io: std.Io, port: ?u16) !*@This() {
-        const monitor = try std.heap.page_allocator.create(@This());
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, port: ?u16) !*@This() {
+        const monitor = try allocator.create(@This());
         monitor.* = .{
             .queue_buffer = undefined,
             .queue = undefined,
@@ -86,7 +35,7 @@ pub const Monitor = struct {
             .connected_ws_event = .unset,
             .stop_event = .unset,
         };
-        monitor.queue = Io.Queue(LogMsg).init(monitor.queue_buffer[0..]);
+        monitor.queue = Io.Queue(Command).init(monitor.queue_buffer[0..]);
 
         const listen_port = port orelse 5678;
         monitor.listen_port = listen_port;
@@ -98,7 +47,7 @@ pub const Monitor = struct {
         monitor.server_thread = try std.Thread.spawn(.{}, startServer, .{ io, address, &monitor.start_server_event, &monitor.connected_ws_event, &monitor.stop_event, &monitor.connected_address, &monitor.address_mutex, &monitor.queue });
 
         try monitor.start_server_event.wait(io);
-        // std.debug.print("open browser at http://127.0.0.1:{d}/?port={d}\n", .{ listen_port, listen_port });
+        std.debug.print("open browser at http://127.0.0.1:{d}/?port={d}\n", .{ listen_port, listen_port });
 
         var url_buffer: [126]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
@@ -107,7 +56,7 @@ pub const Monitor = struct {
         });
 
         try monitor.connected_ws_event.wait(io);
-        // std.debug.print("connected ws: {f}\n", .{monitor.connected_address orelse unreachable});
+        std.debug.print("connected ws: {f}\n", .{monitor.connected_address orelse unreachable});
 
         return monitor;
     }
@@ -138,7 +87,7 @@ pub const Monitor = struct {
         monitor: *@This(),
         io: Io,
         path: []const u8,
-        data: LogData,
+        data: Command,
     ) !void {
         try monitor.queue.putOne(io, .{
             .path = path,
@@ -147,7 +96,7 @@ pub const Monitor = struct {
     }
 };
 
-fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, connected_ws_event: *Io.Event, stop_event: *Io.Event, connected_address: *?net.IpAddress, address_mutex: *Io.Mutex, ch: *Io.Queue(LogMsg)) !void {
+fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, connected_ws_event: *Io.Event, stop_event: *Io.Event, connected_address: *?net.IpAddress, address_mutex: *Io.Mutex, ch: *Io.Queue(Command)) !void {
     var tcp_server = try address.listen(io, .{ .reuse_address = true });
     defer tcp_server.deinit(io);
     start_server_event.set(io);
@@ -182,7 +131,7 @@ fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, co
     }
 }
 
-fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connected_address: *?net.IpAddress, connected_ws_event: *Io.Event, ch: *Io.Queue(LogMsg)) void {
+fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connected_address: *?net.IpAddress, connected_ws_event: *Io.Event, ch: *Io.Queue(Command)) void {
     defer {
         var stream_copy = stream;
         stream_copy.close(io);
@@ -263,7 +212,7 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
     }
 }
 
-fn serveWebSocket(ws: *http.Server.WebSocket, io: Io, ch: *Io.Queue(LogMsg)) void {
+fn serveWebSocket(ws: *http.Server.WebSocket, io: Io, ch: *Io.Queue(Command)) void {
     var buffer: [1024]u8 = undefined;
     while (true) {
         // const message = ws.readSmallMessage() catch |err| switch (err) {
