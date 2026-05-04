@@ -1,10 +1,20 @@
 const std = @import("std");
 const objects = @import("object.zig");
 const commands = @import("commands.zig");
-pub const Command = commands.Command;
+const Command = commands.Command;
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
+
+pub const Geometry = objects.Geometry;
+pub const ArrowGeometry = objects.ArrowGeometry;
+pub const CubeGeometry = objects.CubeGeometry;
+pub const CylinderGeometry = objects.CylinderGeometry;
+pub const FrameGeometry = objects.FrameGeometry;
+pub const SphereGeometry = objects.SphereGeometry;
+pub const Color = objects.Color;
+pub const Material = objects.Material;
+pub const Pose = objects.Pose;
 
 pub const Viewer = struct {
     queue_buffer: [1024]Command,
@@ -47,7 +57,7 @@ pub const Viewer = struct {
         monitor.server_thread = try std.Thread.spawn(.{}, startServer, .{ io, address, &monitor.start_server_event, &monitor.connected_ws_event, &monitor.stop_event, &monitor.connected_address, &monitor.address_mutex, &monitor.queue });
 
         try monitor.start_server_event.wait(io);
-        std.debug.print("open browser at http://127.0.0.1:{d}/?port={d}\n", .{ listen_port, listen_port });
+        std.log.info("open browser at http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
 
         var url_buffer: [126]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
@@ -56,7 +66,7 @@ pub const Viewer = struct {
         });
 
         try monitor.connected_ws_event.wait(io);
-        std.debug.print("connected ws: {f}\n", .{monitor.connected_address orelse unreachable});
+        std.log.info("connected ws: {f}", .{monitor.connected_address orelse unreachable});
 
         return monitor;
     }
@@ -83,16 +93,24 @@ pub const Viewer = struct {
         }
     }
 
-    pub fn log(
+    fn log(
         monitor: *@This(),
         io: Io,
-        path: []const u8,
         data: Command,
     ) !void {
-        try monitor.queue.putOne(io, .{
-            .path = path,
-            .data = data,
-        });
+        try monitor.queue.putOne(io, data);
+    }
+
+    pub fn removeObject(viewer: *@This(), io: Io, id: []const u8) !void {
+        try viewer.log(io, Command{ .remove = .{ .id = id } });
+    }
+
+    pub fn setPose(viewer: *@This(), io: Io, id: []const u8, pose: Pose) !void {
+        try viewer.log(io, Command{ .set_pose = .{ .id = id, .pose = pose } });
+    }
+
+    pub fn createObject(viewer: *@This(), io: Io, id: []const u8, geometry: Geometry, material: Material, pose: Pose) !void {
+        try viewer.log(io, Command{ .add = .{ .id = id, .object = .{ .geometry = geometry, .material = material, .pose = pose } } });
     }
 };
 
