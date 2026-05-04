@@ -5,6 +5,7 @@ const Command = commands.Command;
 const Io = std.Io;
 const net = Io.net;
 const http = std.http;
+const stl_file_max_bytes = 128 * 1024 * 1024;
 
 pub const Geometry = objects.Geometry;
 pub const ArrowGeometry = objects.ArrowGeometry;
@@ -26,6 +27,8 @@ pub const Viewer = struct {
     start_server_event: Io.Event,
     connected_ws_event: Io.Event,
     stop_event: Io.Event,
+    active_connections: std.atomic.Value(usize),
+    no_active_connections_event: Io.Event,
 
     const Status = enum {
         unconnected,
@@ -44,6 +47,8 @@ pub const Viewer = struct {
             .start_server_event = .unset,
             .connected_ws_event = .unset,
             .stop_event = .unset,
+            .active_connections = .init(0),
+            .no_active_connections_event = .is_set,
         };
         monitor.queue = Io.Queue(Command).init(monitor.queue_buffer[0..]);
 
@@ -54,10 +59,9 @@ pub const Viewer = struct {
             .port = listen_port,
         } };
 
-        monitor.server_thread = try std.Thread.spawn(.{}, startServer, .{ io, address, &monitor.start_server_event, &monitor.connected_ws_event, &monitor.stop_event, &monitor.connected_address, &monitor.address_mutex, &monitor.queue });
+        monitor.server_thread = try std.Thread.spawn(.{}, startServer, .{ io, address, &monitor.start_server_event, &monitor.connected_ws_event, &monitor.stop_event, &monitor.connected_address, &monitor.address_mutex, &monitor.queue, &monitor.active_connections, &monitor.no_active_connections_event });
 
         try monitor.start_server_event.wait(io);
-        std.log.info("open browser at http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
 
         var url_buffer: [126]u8 = undefined;
         const url = try std.fmt.bufPrint(&url_buffer, "http://127.0.0.1:{d}/?port={d}", .{ listen_port, listen_port });
@@ -66,7 +70,7 @@ pub const Viewer = struct {
         });
 
         try monitor.connected_ws_event.wait(io);
-        std.log.info("connected ws: {f}", .{monitor.connected_address orelse unreachable});
+        // std.log.info("connected ws: {f}", .{monitor.connected_address orelse unreachable});
 
         return monitor;
     }
@@ -91,6 +95,10 @@ pub const Viewer = struct {
             server_thread.join();
             monitor.server_thread = null;
         }
+
+        if (monitor.active_connections.load(.monotonic) != 0) {
+            monitor.no_active_connections_event.waitUncancelable(io);
+        }
     }
 
     fn log(
@@ -114,15 +122,11 @@ pub const Viewer = struct {
     }
 };
 
-fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, connected_ws_event: *Io.Event, stop_event: *Io.Event, connected_address: *?net.IpAddress, address_mutex: *Io.Mutex, ch: *Io.Queue(Command)) !void {
+fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, connected_ws_event: *Io.Event, stop_event: *Io.Event, connected_address: *?net.IpAddress, address_mutex: *Io.Mutex, ch: *Io.Queue(Command), active_connections: *std.atomic.Value(usize), no_active_connections_event: *Io.Event) !void {
     var tcp_server = try address.listen(io, .{ .reuse_address = true });
     defer tcp_server.deinit(io);
     start_server_event.set(io);
     while (true) {
-        if (stop_event.isSet()) {
-            break;
-        }
-
         const stream = tcp_server.accept(io) catch |err| {
             if (stop_event.isSet()) {
                 break;
@@ -136,23 +140,22 @@ fn startServer(io: Io, address: net.IpAddress, start_server_event: *Io.Event, co
             break;
         }
 
-        if (!connected_ws_event.isSet()) {
-            var connection_thread = std.Thread.spawn(.{}, handleConnection, .{ io, stream, address_mutex, connected_address, connected_ws_event, ch }) catch |err| {
-                std.debug.print("connection thread spawn failed: {s}\n", .{@errorName(err)});
-                stream.close(io);
-                continue;
-            };
-            connection_thread.detach();
-        } else {
+        connectionOpened(active_connections, no_active_connections_event);
+        var connection_thread = std.Thread.spawn(.{}, handleConnection, .{ io, stream, address_mutex, connected_address, connected_ws_event, ch, active_connections, no_active_connections_event }) catch |err| {
+            connectionClosed(io, active_connections, no_active_connections_event);
+            std.debug.print("connection thread spawn failed: {s}\n", .{@errorName(err)});
             stream.close(io);
-        }
+            continue;
+        };
+        connection_thread.detach();
     }
 }
 
-fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connected_address: *?net.IpAddress, connected_ws_event: *Io.Event, ch: *Io.Queue(Command)) void {
+fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connected_address: *?net.IpAddress, connected_ws_event: *Io.Event, ch: *Io.Queue(Command), active_connections: *std.atomic.Value(usize), no_active_connections_event: *Io.Event) void {
     defer {
         var stream_copy = stream;
         stream_copy.close(io);
+        connectionClosed(io, active_connections, no_active_connections_event);
     }
     const address = stream.socket.address;
 
@@ -164,20 +167,27 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
 
     while (true) {
         var request = server.receiveHead() catch |err| switch (err) {
-            error.HttpConnectionClosing => return,
+            error.HttpConnectionClosing => {
+                std.log.info("http connection closing: {s}\n", .{@errorName(err)});
+                return;
+            },
             else => {
-                std.debug.print("request read failed: {s}\n", .{@errorName(err)});
+                std.log.info("request read failed: {s}\n", .{@errorName(err)});
                 return;
             },
         };
-        // std.log.info("request: {s}", .{request.head_buffer});
 
         if (std.mem.eql(u8, request.head.target, "/ws")) {
+            if (connected_ws_event.isSet()) {
+                respondText(&request, .bad_request, "websocket already connected\n");
+                return;
+            }
+
             switch (request.upgradeRequested()) {
                 .websocket => |opt_key| {
                     const key = opt_key orelse {
                         respondText(&request, .bad_request, "missing Sec-WebSocket-Key\n");
-                        continue;
+                        return;
                     };
 
                     var ws = request.respondWebSocket(.{ .key = key }) catch |err| {
@@ -189,11 +199,6 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
                     connected_address.* = address;
                     address_mutex.unlock(io);
                     connected_ws_event.set(io);
-
-                    // ws.writeMessage("connected\n", .text) catch |err| {
-                    //     std.debug.print("websocket welcome failed: {s}\n", .{@errorName(err)});
-                    //     return;
-                    // };
 
                     serveWebSocket(&ws, io, ch);
                     return;
@@ -211,10 +216,12 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
         }
 
         // std.debug.print("{s}", .{request.head.target});
+        // std.log.debug("{s}", .{request.head.target});
         // const a = std.mem.startsWith(u8, request.head.target, "/?port=");
         var iter = std.mem.splitSequence(u8, request.head.target, "?");
+        const header = iter.first();
 
-        if (std.mem.eql(u8, iter.first(), "/")) {
+        if (std.mem.eql(u8, header, "/")) {
             request.respond(@embedFile("index.html"), .{
                 .extra_headers = &.{
                     .{ .name = "Content-Type", .value = "text/html; charset=utf-8" },
@@ -223,7 +230,12 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
                 std.debug.print("failed to send index page: {s}\n", .{@errorName(err)});
                 return;
             };
-            continue;
+            return;
+        }
+
+        if (std.ascii.endsWithIgnoreCase(header, ".stl")) {
+            respondStlFile(&request, io, header);
+            return;
         }
 
         respondText(&request, .not_found, "not found\n");
@@ -233,25 +245,6 @@ fn handleConnection(io: Io, stream: net.Stream, address_mutex: *Io.Mutex, connec
 fn serveWebSocket(ws: *http.Server.WebSocket, io: Io, ch: *Io.Queue(Command)) void {
     var buffer: [1024]u8 = undefined;
     while (true) {
-        // const message = ws.readSmallMessage() catch |err| switch (err) {
-        //     error.ConnectionClose, error.EndOfStream => return,
-        //     else => {
-        //         std.debug.print("websocket read failed: {s}\n", .{@errorName(err)});
-        //         return;
-        //     },
-        // };
-
-        // switch (message.opcode) {
-        //     .text, .binary => ws.writeMessage(message.data, message.opcode) catch |err| {
-        //         std.debug.print("websocket echo failed: {s}\n", .{@errorName(err)});
-        //         return;
-        //     },
-        //     .ping => ws.writeMessage(message.data, .pong) catch |err| {
-        //         std.debug.print("websocket pong failed: {s}\n", .{@errorName(err)});
-        //         return;
-        //     },
-        //     else => {},
-        // }
         const msg = ch.getOne(io) catch {
             break;
         };
@@ -265,6 +258,89 @@ fn serveWebSocket(ws: *http.Server.WebSocket, io: Io, ch: *Io.Queue(Command)) vo
             break;
         };
     }
+}
+
+fn connectionOpened(active_connections: *std.atomic.Value(usize), no_active_connections_event: *Io.Event) void {
+    const previous = active_connections.fetchAdd(1, .monotonic);
+    if (previous == 0) {
+        no_active_connections_event.reset();
+    }
+}
+
+fn connectionClosed(io: Io, active_connections: *std.atomic.Value(usize), no_active_connections_event: *Io.Event) void {
+    const previous = active_connections.fetchSub(1, .monotonic);
+    std.debug.assert(previous > 0);
+    if (previous == 1) {
+        no_active_connections_event.set(io);
+    }
+}
+
+fn respondStlFile(request: *http.Server.Request, io: Io, target: []const u8) void {
+    const relative_file_path = sanitizeStlTarget(target) orelse {
+        respondText(request, .bad_request, "invalid stl path\n");
+        return;
+    };
+
+    const file_contents = Io.Dir.cwd().readFileAlloc(io, relative_file_path, std.heap.page_allocator, .limited(stl_file_max_bytes)) catch |err| switch (err) {
+        error.FileNotFound => {
+            respondText(request, .not_found, "stl not found\n");
+            return;
+        },
+        error.StreamTooLong => {
+            respondText(request, .payload_too_large, "stl file too large\n");
+            return;
+        },
+        else => {
+            std.debug.print("failed to read stl file '{s}': {s}\n", .{ relative_file_path, @errorName(err) });
+            respondText(request, .internal_server_error, "failed to read stl file\n");
+            return;
+        },
+    };
+    defer std.heap.page_allocator.free(file_contents);
+
+    request.respond(file_contents, .{
+        .keep_alive = false,
+        .extra_headers = &.{
+            .{ .name = "Content-Type", .value = "model/stl" },
+        },
+    }) catch |err| {
+        std.debug.print("failed to send stl file '{s}': {s}\n", .{ relative_file_path, @errorName(err) });
+    };
+}
+
+fn sanitizeStlTarget(target: []const u8) ?[]const u8 {
+    if (!std.ascii.endsWithIgnoreCase(target, ".stl")) {
+        return null;
+    }
+    if (std.mem.indexOfScalar(u8, target, '\\') != null) {
+        return null;
+    }
+
+    const raw_path = std.mem.trimStart(u8, target, "/");
+    if (raw_path.len == 0 or Io.Dir.path.isAbsolute(raw_path)) {
+        return null;
+    }
+
+    var iter = Io.Dir.path.ComponentIterator(.posix, u8).init(raw_path);
+    while (iter.next()) |component| {
+        if (std.mem.eql(u8, component.name, "..")) {
+            return null;
+        }
+    }
+
+    return raw_path;
+}
+
+test "sanitize stl target accepts relative stl paths" {
+    try std.testing.expectEqualStrings("a.stl", sanitizeStlTarget("/a.stl") orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings("meshes/a.STL", sanitizeStlTarget("/meshes/a.STL") orelse return error.TestUnexpectedResult);
+}
+
+test "sanitize stl target rejects unsafe or non stl paths" {
+    try std.testing.expectEqual(@as(?[]const u8, null), sanitizeStlTarget("/a.obj"));
+    try std.testing.expectEqual(@as(?[]const u8, null), sanitizeStlTarget("/../a.stl"));
+    try std.testing.expectEqual(@as(?[]const u8, null), sanitizeStlTarget("/meshes/../a.stl"));
+    try std.testing.expectEqual(@as(?[]const u8, null), sanitizeStlTarget("/meshes\\a.stl"));
 }
 
 fn respondText(request: *http.Server.Request, status: http.Status, body: []const u8) void {

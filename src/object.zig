@@ -10,13 +10,7 @@ pub const Pose = struct {
     }
 };
 
-pub const Geometry = union(enum) {
-    cube: CubeGeometry,
-    sphere: SphereGeometry,
-    cylinder: CylinderGeometry,
-    arrow: ArrowGeometry,
-    frame: FrameGeometry,
-};
+pub const Geometry = union(enum) { cube: CubeGeometry, sphere: SphereGeometry, cylinder: CylinderGeometry, arrow: ArrowGeometry, frame: FrameGeometry, mesh: MeshGeometry };
 
 pub const CubeGeometry = struct {
     width: f32 = 1,
@@ -47,6 +41,10 @@ pub const ArrowGeometry = struct {
 pub const FrameGeometry = struct {
     axis_length: f32 = 1,
     axis_radius: f32 = 0.01,
+};
+
+pub const MeshGeometry = struct {
+    path: []const u8,
 };
 
 pub const Color = struct {
