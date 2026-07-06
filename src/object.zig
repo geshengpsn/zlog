@@ -1,9 +1,15 @@
 const std = @import("std");
-const zla = @import("zla");
+
+pub const Quaternion = struct {
+    w: f64 = 1,
+    x: f64 = 0,
+    y: f64 = 0,
+    z: f64 = 0,
+};
 
 pub const Pose = struct {
     position: @Vector(3, f64) = @splat(0),
-    rotation: zla.Quaternion(f64) = .{ .w = 1, .x = 0, .y = 0, .z = 0 },
+    rotation: Quaternion = .{ .w = 1, .x = 0, .y = 0, .z = 0 },
 
     pub fn identity() Pose {
         return .{};

@@ -9,8 +9,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    const zla_dep = b.dependency("zla", .{});
-    zlog.addImport("zla", zla_dep.module("zla"));
+    // const zla_dep = b.dependency("zla", .{});
+    // zlog.addImport("zla", zla_dep.module("zla"));
 
     const exe = b.addExecutable(.{
         .name = "zlog_main",

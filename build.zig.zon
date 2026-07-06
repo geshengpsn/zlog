@@ -32,10 +32,10 @@
     // Once all dependencies are fetched, `zig build` no longer requires
     // internet connectivity.
     .dependencies = .{
-        .zla = .{
-            .url = "git+https://github.com/geshengpsn/zla.git#2facd03ee7d9d4565907653baaae1358d07e8850",
-            .hash = "zla-0.0.0-7oyaWgW-AADsFDEHdU4iktlsTjFacbexkqL0oOGpjwaL",
-        },
+        // .zla = .{
+        //     .url = "git+https://github.com/geshengpsn/zla.git#2facd03ee7d9d4565907653baaae1358d07e8850",
+        //     .hash = "zla-0.0.0-7oyaWgW-AADsFDEHdU4iktlsTjFacbexkqL0oOGpjwaL",
+        // },
     },
     .paths = .{
         "build.zig",
